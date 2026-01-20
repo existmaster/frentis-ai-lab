@@ -1,6 +1,9 @@
 /**
  * Frentis AI Agent Platform
  * GitHub Issue Auto-Triage and Response System
+ *
+ * Uses GitHub App authentication with webhook-only architecture.
+ * Responds only when @frentis-agent is mentioned.
  */
 
 import { Hono } from 'hono';
@@ -8,22 +11,14 @@ import { logger } from 'hono/logger';
 import { cors } from 'hono/cors';
 import { loadConfig, loadReposConfig } from './config';
 import { WebhookHandler } from './webhook/handler';
-import { IssuePoller } from './poller';
 import type { RepoConfig } from './types';
 
 // Load configuration
 const config = loadConfig();
 const repos = loadReposConfig();
 
-// Initialize webhook handler
-const webhookHandler = new WebhookHandler(
-  config.github.webhookSecret,
-  config.github.token,
-  repos
-);
-
-// Initialize poller (30 second interval)
-const poller = new IssuePoller(repos, 30000);
+// Initialize webhook handler with GitHub App config
+const webhookHandler = new WebhookHandler(config.github, repos);
 
 // Create Hono app
 const app = new Hono();
@@ -36,27 +31,16 @@ app.use('*', cors());
 app.get('/', (c) => {
   return c.json({
     name: 'Frentis AI Agent Platform',
-    version: '0.1.0',
+    version: '0.2.0',
     status: 'running',
+    botUsername: config.github.botUsername,
     endpoints: {
       webhook: '/webhook',
       repos: '/repos',
       health: '/health',
-      poller: '/poller (start/stop)',
       analyze: '/analyze',
     },
   });
-});
-
-// Poller control
-app.post('/poller/start', (c) => {
-  poller.start();
-  return c.json({ status: 'started', interval: '30s' });
-});
-
-app.post('/poller/stop', (c) => {
-  poller.stop();
-  return c.json({ status: 'stopped' });
 });
 
 app.get('/health', (c) => {
@@ -157,13 +141,17 @@ app.post('/analyze', async (c) => {
 
 // Start server
 const port = config.server.port;
+const botName = config.github.botUsername;
 console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║                                                            ║
-║   🤖 Frentis AI Agent Platform                            ║
+║   🤖 Frentis AI Agent Platform v0.2.0                     ║
 ║                                                            ║
 ║   Server running on http://localhost:${port}                 ║
 ║   Webhook endpoint: http://localhost:${port}/webhook         ║
+║   Bot username: @${botName}                       ║
+║                                                            ║
+║   Responds only when @${botName} is mentioned     ║
 ║                                                            ║
 ║   For external access, use ngrok:                         ║
 ║   $ ngrok http ${port}                                       ║

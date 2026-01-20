@@ -1,75 +1,135 @@
 /**
  * GitHub Webhook Handler
+ * Supports GitHub App authentication with mention-based triggering
  */
 
 import { Webhooks } from '@octokit/webhooks';
-import type { IssueContext, RepoConfig } from '../types';
-import { createGitHubClient, type IGitHubClient } from '../github/client';
+import type {
+  IssueContext,
+  RepoConfig,
+  GitHubAppConfig,
+  ConversationContext,
+} from '../types';
+import { createGitHubClient, OctokitClient } from '../github/client';
+import { GitHubAppAuth } from '../github/auth';
 import { ClaudeAgent } from '../claude/agent';
+import { MentionDetector } from './mention-detector';
+import { LoopPrevention } from './loop-prevention';
 
 export class WebhookHandler {
   private webhooks: Webhooks;
-  private githubClient: IGitHubClient;
+  private githubConfig: GitHubAppConfig;
   private claudeAgent: ClaudeAgent;
   private repoConfigs: Map<string, RepoConfig>;
+  private mentionDetector: MentionDetector;
+  private loopPrevention: LoopPrevention;
 
-  constructor(
-    webhookSecret: string,
-    githubToken?: string, // Optional: gh CLI doesn't need token
-    repos: RepoConfig[] = []
-  ) {
-    this.webhooks = new Webhooks({ secret: webhookSecret });
-    this.githubClient = createGitHubClient(githubToken);
+  constructor(config: GitHubAppConfig, repos: RepoConfig[] = []) {
+    this.webhooks = new Webhooks({ secret: config.webhookSecret });
+    this.githubConfig = config;
     this.claudeAgent = new ClaudeAgent();
     this.repoConfigs = new Map(
       repos.map((r) => [`${r.owner}/${r.name}`, r])
     );
+    this.mentionDetector = new MentionDetector(config.botUsername);
+    this.loopPrevention = new LoopPrevention(config.botUsername);
 
     this.setupHandlers();
   }
 
+  /**
+   * Create a GitHub client for a specific installation
+   */
+  private createClientForInstallation(installationId: number): OctokitClient {
+    return new OctokitClient(this.githubConfig, installationId);
+  }
+
   private setupHandlers() {
-    // Handle new issues
-    this.webhooks.on('issues.opened', async ({ payload }) => {
+    // Handle new issues - only respond if bot is mentioned in the issue body
+    this.webhooks.on('issues.opened', async ({ payload, id }) => {
       const repoKey = payload.repository.full_name;
       const config = this.repoConfigs.get(repoKey);
+      const installationId = payload.installation?.id;
 
-      if (!config?.enabled) {
-        console.log(`[SKIP] Repo not enabled: ${repoKey}`);
+      if (!config?.enabled || !installationId) {
+        console.log(`[SKIP] Repo not enabled or no installation: ${repoKey}`);
+        return;
+      }
+
+      const issueKey = `${repoKey}#${payload.issue.number}`;
+
+      // Check for loop prevention
+      const loopCheck = this.loopPrevention.check(
+        payload.issue.user?.login || '',
+        issueKey,
+        id
+      );
+      if (loopCheck.shouldIgnore) {
+        console.log(`[SKIP] Loop prevention: ${loopCheck.reason}`);
+        return;
+      }
+
+      // Check for mention in issue body
+      const mentionResult = this.mentionDetector.detect(payload.issue.body || '');
+      if (!mentionResult.isMentioned) {
+        console.log(`[SKIP] No mention in issue #${payload.issue.number}`);
         return;
       }
 
       console.log(`[NEW ISSUE] #${payload.issue.number}: ${payload.issue.title}`);
 
+      const client = this.createClientForInstallation(installationId);
       const context = this.buildIssueContext(payload);
-      await this.processIssue(context, config);
-    });
-
-    // Handle issue edits (optional: re-analyze on significant changes)
-    this.webhooks.on('issues.edited', async ({ payload }) => {
-      const repoKey = payload.repository.full_name;
-      const config = this.repoConfigs.get(repoKey);
-
-      if (!config?.enabled) return;
-
-      console.log(`[EDITED] #${payload.issue.number}: ${payload.issue.title}`);
-      // Could re-analyze if body changed significantly
+      await this.processIssue(context, config, client, id);
     });
 
     // Handle issue comments (for @bot mentions)
-    this.webhooks.on('issue_comment.created', async ({ payload }) => {
+    this.webhooks.on('issue_comment.created', async ({ payload, id }) => {
       const repoKey = payload.repository.full_name;
       const config = this.repoConfigs.get(repoKey);
+      const installationId = payload.installation?.id;
 
-      if (!config?.enabled) return;
+      if (!config?.enabled || !installationId) return;
 
-      // Check if bot is mentioned
-      const body = payload.comment.body;
-      if (body.includes('@frentis-bot') || body.includes('/analyze')) {
-        console.log(`[MENTION] #${payload.issue.number}`);
-        const context = this.buildIssueContextFromComment(payload);
-        await this.processIssue(context, config);
+      const issueKey = `${repoKey}#${payload.issue.number}`;
+      const commentAuthor = payload.comment.user?.login || '';
+
+      // Check for loop prevention
+      const loopCheck = this.loopPrevention.check(commentAuthor, issueKey, id);
+      if (loopCheck.shouldIgnore) {
+        console.log(`[SKIP] Loop prevention: ${loopCheck.reason}`);
+        return;
       }
+
+      // Check for mention in comment body
+      const body = payload.comment.body || '';
+      const mentionResult = this.mentionDetector.detect(body);
+
+      if (!mentionResult.isMentioned) {
+        console.log(`[SKIP] No mention in comment on #${payload.issue.number}`);
+        return;
+      }
+
+      console.log(`[MENTION] #${payload.issue.number} by @${commentAuthor}`);
+
+      const client = this.createClientForInstallation(installationId);
+      const context = this.buildIssueContext(payload);
+
+      // Collect conversation context
+      const conversationContext = await this.collectConversationContext(
+        client,
+        payload.repository.owner.login,
+        payload.repository.name,
+        payload.issue.number
+      );
+
+      await this.processIssueWithConversation(
+        context,
+        conversationContext,
+        config,
+        client,
+        id
+      );
     });
   }
 
@@ -111,30 +171,44 @@ export class WebhookHandler {
     };
   }
 
-  private buildIssueContextFromComment(payload: {
-    issue: {
-      number: number;
-      title: string;
-      body: string | null;
-      user: { login: string } | null;
-      labels?: Array<{ name: string }>;
-      created_at: string;
-      html_url: string;
+  /**
+   * Collect conversation context from issue comments
+   */
+  private async collectConversationContext(
+    client: OctokitClient,
+    owner: string,
+    repo: string,
+    issueNumber: number
+  ): Promise<ConversationContext> {
+    const comments = await client.getIssueComments(owner, repo, issueNumber);
+
+    // Find last bot comment
+    const botComments = comments.filter((c) => client.isBotUser(c.author));
+    const lastBotComment = botComments[botComments.length - 1];
+
+    return {
+      issueNumber,
+      owner,
+      repo,
+      comments,
+      lastBotCommentId: lastBotComment?.id,
     };
-    repository: {
-      owner: { login: string };
-      name: string;
-      full_name: string;
-      default_branch: string;
-      clone_url: string;
-    };
-  }): IssueContext {
-    return this.buildIssueContext(payload);
   }
 
-  private async processIssue(context: IssueContext, config: RepoConfig) {
+  /**
+   * Process issue (new issue with mention)
+   */
+  private async processIssue(
+    context: IssueContext,
+    config: RepoConfig,
+    client: OctokitClient,
+    eventId: string
+  ) {
     try {
       console.log(`[ANALYZING] Issue #${context.issue.number}...`);
+
+      // Mark event as processed
+      this.loopPrevention.markProcessed(eventId);
 
       // Analyze with Claude
       const analysis = await this.claudeAgent.analyzeIssue(
@@ -142,11 +216,13 @@ export class WebhookHandler {
         config.localPath
       );
 
-      console.log(`[RESULT] Type: ${analysis.classification.type}, Priority: ${analysis.classification.priority}`);
+      console.log(
+        `[RESULT] Type: ${analysis.classification.type}, Priority: ${analysis.classification.priority}`
+      );
 
       // Add labels if enabled
       if (config.autoLabel && analysis.labels.length > 0) {
-        await this.githubClient.addLabels(
+        await client.addLabels(
           context.repository.owner,
           context.repository.name,
           context.issue.number,
@@ -157,16 +233,82 @@ export class WebhookHandler {
 
       // Post response if enabled
       if (config.autoRespond) {
-        await this.githubClient.createComment(
+        const result = await client.createComment(
           context.repository.owner,
           context.repository.name,
           context.issue.number,
           analysis.response
         );
-        console.log(`[RESPONDED] Comment posted`);
+        console.log(`[RESPONDED] Comment posted (ID: ${result.id})`);
+
+        // Record response for loop prevention
+        const issueKey = `${context.repository.full_name}#${context.issue.number}`;
+        this.loopPrevention.recordResponse(issueKey, eventId);
       }
     } catch (error) {
-      console.error(`[ERROR] Failed to process issue #${context.issue.number}:`, error);
+      console.error(
+        `[ERROR] Failed to process issue #${context.issue.number}:`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Process issue with conversation context (reply to comment mention)
+   */
+  private async processIssueWithConversation(
+    context: IssueContext,
+    conversationContext: ConversationContext,
+    config: RepoConfig,
+    client: OctokitClient,
+    eventId: string
+  ) {
+    try {
+      console.log(
+        `[ANALYZING] Issue #${context.issue.number} with ${conversationContext.comments.length} comments...`
+      );
+
+      // Mark event as processed
+      this.loopPrevention.markProcessed(eventId);
+
+      // Build conversation history for Claude
+      const conversationHistory = conversationContext.comments
+        .map((c) => `@${c.author}: ${c.body}`)
+        .join('\n\n---\n\n');
+
+      // Analyze with conversation context
+      const analysis = await this.claudeAgent.analyzeIssue(
+        {
+          ...context,
+          issue: {
+            ...context.issue,
+            body: `${context.issue.body || ''}\n\n## Conversation History\n\n${conversationHistory}`,
+          },
+        },
+        config.localPath
+      );
+
+      console.log(
+        `[RESULT] Type: ${analysis.classification.type}, Priority: ${analysis.classification.priority}`
+      );
+
+      // Post response (always respond to mentions)
+      const result = await client.createComment(
+        context.repository.owner,
+        context.repository.name,
+        context.issue.number,
+        analysis.response
+      );
+      console.log(`[RESPONDED] Comment posted (ID: ${result.id})`);
+
+      // Record response for loop prevention
+      const issueKey = `${context.repository.full_name}#${context.issue.number}`;
+      this.loopPrevention.recordResponse(issueKey, eventId);
+    } catch (error) {
+      console.error(
+        `[ERROR] Failed to process issue #${context.issue.number}:`,
+        error
+      );
     }
   }
 

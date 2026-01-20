@@ -23,8 +23,8 @@ export interface CollectedContext {
 export class ContextCollector {
   private githubClient: IGitHubClient;
 
-  constructor(githubToken?: string) {
-    this.githubClient = createGitHubClient(githubToken);
+  constructor(githubClient?: IGitHubClient) {
+    this.githubClient = githubClient || createGitHubClient();
   }
 
   /**

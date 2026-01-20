@@ -52,11 +52,16 @@ export interface RelatedIssue {
   status: 'open' | 'closed';
 }
 
+export interface GitHubAppConfig {
+  appId: string;
+  privateKeyPath: string;
+  webhookSecret: string;
+  botUsername: string; // e.g., 'frentis-agent'
+  installationId?: number; // Optional: can be auto-detected
+}
+
 export interface AgentConfig {
-  github: {
-    token?: string; // Optional when using gh CLI
-    webhookSecret: string;
-  };
+  github: GitHubAppConfig;
   claude: {
     apiKey?: string; // claude-code uses ANTHROPIC_API_KEY env
   };
@@ -65,6 +70,22 @@ export interface AgentConfig {
     host: string;
   };
   repos: RepoConfig[];
+}
+
+export interface ConversationContext {
+  issueNumber: number;
+  owner: string;
+  repo: string;
+  comments: CommentInfo[];
+  lastBotCommentId?: number;
+}
+
+export interface CommentInfo {
+  id: number;
+  author: string;
+  body: string;
+  createdAt: string;
+  isBot: boolean;
 }
 
 export interface RepoConfig {

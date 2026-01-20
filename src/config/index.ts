@@ -6,9 +6,17 @@ import { z } from 'zod';
 import type { AgentConfig } from '../types';
 
 const envSchema = z.object({
-  GITHUB_TOKEN: z.string().optional(), // Optional when using gh CLI
-  GITHUB_WEBHOOK_SECRET: z.string().default('dev-secret'), // Default for local testing
+  // GitHub App configuration
+  GITHUB_APP_ID: z.string(),
+  GITHUB_PRIVATE_KEY_PATH: z.string().default('./private-key.pem'),
+  GITHUB_WEBHOOK_SECRET: z.string().default('dev-secret'),
+  GITHUB_BOT_USERNAME: z.string().default('frentis-agent'),
+  GITHUB_INSTALLATION_ID: z.string().optional(),
+
+  // Claude configuration
   ANTHROPIC_API_KEY: z.string().optional(),
+
+  // Server configuration
   PORT: z.string().default('3000'),
   HOST: z.string().default('0.0.0.0'),
 });
@@ -18,8 +26,13 @@ export function loadConfig(): AgentConfig {
 
   return {
     github: {
-      token: env.GITHUB_TOKEN,
-      webhookSecret: env.GITHUB_WEBHOOK_SECRET, // 'dev-secret' for local testing
+      appId: env.GITHUB_APP_ID,
+      privateKeyPath: env.GITHUB_PRIVATE_KEY_PATH,
+      webhookSecret: env.GITHUB_WEBHOOK_SECRET,
+      botUsername: env.GITHUB_BOT_USERNAME,
+      installationId: env.GITHUB_INSTALLATION_ID
+        ? parseInt(env.GITHUB_INSTALLATION_ID, 10)
+        : undefined,
     },
     claude: {
       apiKey: env.ANTHROPIC_API_KEY,
