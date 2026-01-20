@@ -1,0 +1,10 @@
+[
+  {
+    "owner": "existmaster",
+    "name": "frentis-agent-test",
+    "localPath": null,
+    "enabled": true,
+    "autoLabel": true,
+    "autoRespond": true
+  }
+]
